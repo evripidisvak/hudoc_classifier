@@ -203,7 +203,7 @@ class JudgmentsTagger(pl.LightningModule):
         # Calculate loss on document-level predictions
         loss = self.criterion(doc_outputs, labels)
 
-        self.log("train_loss", loss, prog_bar=True, logger=True)
+        self.log("train_loss", loss, prog_bar=True, logger=True, batch_size=self.batch_size)
 
         return loss
 
@@ -218,7 +218,7 @@ class JudgmentsTagger(pl.LightningModule):
         # Calculate loss on document-level predictions
         loss = self.criterion(doc_outputs, labels)
 
-        self.log("val_loss", loss, prog_bar=True, logger=True)
+        self.log("val_loss", loss, prog_bar=True, logger=True, batch_size=self.batch_size)
 
         return loss
 
@@ -238,7 +238,7 @@ class JudgmentsTagger(pl.LightningModule):
         accuracy = (preds_binary == labels).float().mean(dim=0)
 
         # Log average accuracy
-        self.log("test_accuracy", accuracy.mean(), logger=True)
+        self.log("test_accuracy", accuracy.mean(), logger=True, batch_size=self.batch_size)
 
         return {"test_preds": preds, "test_labels": labels}
 
