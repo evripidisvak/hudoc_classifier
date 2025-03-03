@@ -6,7 +6,6 @@ import json
 import gc
 
 print("Defining parameters...")
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6,max_split_size_mb:512"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.6,max_split_size_mb:512"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
@@ -33,35 +32,27 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics.functional import accuracy, auroc, f1_score, precision, recall
 from transformers import (
-    BertModel,
-    BertTokenizerFast as BertTokenizer,
+    DistilBertModel,
+    DistilBertTokenizerFast as DistilBertTokenizer,
     get_linear_schedule_with_warmup,
-    )
-from transformers import (
-    LongformerConfig,
-    LongformerModel,
-    LongformerTokenizerFast as LongformerTokenizer,
     DataCollatorWithPadding,
     )
 
-
 RANDOM_SEED = 42
-MAX_TOKEN_COUNT = 3072
+MAX_TOKEN_COUNT = 512  # DistilBERT's maximum token length
+CHUNK_OVERLAP = 50  # Number of overlapping tokens between chunks
 N_EPOCHS = 10
 N_ACCUMULATE_BATCHES = 2
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 GRADIENT_ACCUMULATION_STEPS = 2
 EVAL_FREQUENCY = 1
-# EVAL_FREQUENCY = 4
-SLIDING_WINDOW_STRIDE = 0.8
 HIDDEN_DROPOUT_PROB = 0.3
 ATTENTION_PROBS_DROPOUT_PROB = 0.3
-ATTENTION_WINDOW = 64
-BERT_MODEL_NAME = "allenai/longformer-base-4096"
+BERT_MODEL_NAME = "distilbert-base-uncased"
 DB_PATH = "/teamspace/studios/this_studio/echr_cases_anonymized.sqlite"
 
 model_name = "echr_judgments_classifier"
-model_dir = "/teamspace/studios/this_studio/echr_longformer_model"
+model_dir = "/teamspace/studios/this_studio/echr_distilbert_model"
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english"))
 LR_CONFIG = model_dir + "/lr_config.json"
@@ -75,63 +66,110 @@ os.makedirs(model_dir, exist_ok=True)
 torch.set_float32_matmul_precision("medium")
 torch.backends.cuda.matmul.allow_tf32 = True
 
+
 class JudgmentsDataset(Dataset):
     def __init__(
             self,
             data: pd.DataFrame,
-            tokenizer: LongformerTokenizer,
-            max_token_len: int = 2048,
-            sliding_window_stride: float = SLIDING_WINDOW_STRIDE,
+            tokenizer: DistilBertTokenizer,
+            max_token_len: int = MAX_TOKEN_COUNT,
+            chunk_overlap: int = CHUNK_OVERLAP
             ):
         self.tokenizer = tokenizer
-        # self.data = data
         self.data = data[['judgment'] + ARTICLES_COLUMNS].copy()
         self.max_token_len = max_token_len
-        self.stride = int(max_token_len * sliding_window_stride)
+        self.chunk_overlap = chunk_overlap
 
     def __len__(self):
         return len(self.data)
+
+    def create_chunks(self, text):
+        # Tokenize the entire text
+        tokens = self.tokenizer.tokenize(text)
+
+        # Calculate chunk size (leaving room for special tokens)
+        chunk_size = self.max_token_len - 2  # Account for [CLS] and [SEP]
+
+        # If text is shorter than max length, return it as a single chunk
+        if len(tokens) <= chunk_size:
+            return [text]
+
+        chunks = []
+        start = 0
+        while start < len(tokens):
+            # Get chunk of tokens
+            chunk_tokens = tokens[start:start + chunk_size]
+            # Convert tokens back to text
+            chunk_text = self.tokenizer.convert_tokens_to_string(chunk_tokens)
+            chunks.append(chunk_text)
+            # Move start pointer, accounting for overlap
+            start += (chunk_size - self.chunk_overlap)
+
+        return chunks
 
     def __getitem__(self, index: int):
         data_row = self.data.iloc[index]
         judgment = data_row.judgment
         labels = data_row[ARTICLES_COLUMNS]
-        # Convert labels to float32
         labels = labels.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-        # Use sliding window tokenization
-        encodings = self.tokenizer(
-                judgment,
-                max_length=self.max_token_len,
-                stride=self.stride,
-                return_overflowing_tokens=True,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-                )
+        # Split text into chunks
+        chunks = self.create_chunks(judgment)
 
-        # Handle multiple chunks
-        num_chunks = len(encodings["input_ids"])
-        print(f"Judgment split into {num_chunks} chunks")
+        # Tokenize all chunks
+        encodings = [
+                self.tokenizer(
+                        chunk,
+                        max_length=self.max_token_len,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt"
+                        ) for chunk in chunks
+                ]
 
-        # Create labels tensor for all chunks
-        labels_tensor = torch.tensor(
-                labels.values.astype(np.float32), dtype=torch.float32
-                )
+        # Prepare the final tensors
+        input_ids = torch.cat([encoding["input_ids"] for encoding in encodings])
+        attention_mask = torch.cat([encoding["attention_mask"] for encoding in encodings])
 
-        # Create individual samples for each chunk
-        chunked_samples = []
-        for i in range(num_chunks):
-            chunked_samples.append(
-                    {
-                            "input_ids": encodings["input_ids"][i],
-                            "attention_mask": encodings["attention_mask"][i],
-                            "labels": labels_tensor,
-                            }
-                    )
+        # Create labels tensor (same labels for all chunks)
+        labels_tensor = torch.tensor(labels.values.astype(np.float32), dtype=torch.float32)
+        labels_repeated = labels_tensor.unsqueeze(0).repeat(len(chunks), 1)
 
-        return chunked_samples  # Returns a list of samples
+        return {
+                "input_ids": input_ids.squeeze(),
+                "attention_mask": attention_mask.squeeze(),
+                "labels": labels_repeated,
+                "chunk_count": len(chunks)
+                }
 
+class ChunkCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        # Separate the chunks and their metadata
+        max_chunks = max(item["chunk_count"] for item in batch)
+
+        # Initialize tensors for the batch
+        batch_size = len(batch)
+        input_ids = torch.zeros(batch_size, max_chunks, MAX_TOKEN_COUNT, dtype=torch.long)
+        attention_mask = torch.zeros(batch_size, max_chunks, MAX_TOKEN_COUNT, dtype=torch.long)
+        labels = torch.zeros(batch_size, max_chunks, len(ARTICLES_COLUMNS), dtype=torch.float)
+        chunk_counts = torch.tensor([item["chunk_count"] for item in batch])
+
+        # Fill the tensors
+        for i, item in enumerate(batch):
+            chunks = item["chunk_count"]
+            input_ids[i, :chunks] = item["input_ids"]
+            attention_mask[i, :chunks] = item["attention_mask"]
+            labels[i, :chunks] = item["labels"]
+
+        return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "chunk_counts": chunk_counts
+                }
 
 class JudgmentsDataModule(pl.LightningDataModule):
     def __init__(
@@ -139,9 +177,9 @@ class JudgmentsDataModule(pl.LightningDataModule):
             train_df,
             test_df,
             tokenizer,
-            batch_size=8,
-            max_token_len=2048,
-            sliding_window_stride= SLIDING_WINDOW_STRIDE,
+            batch_size=32,
+            max_token_len=MAX_TOKEN_COUNT,
+            chunk_overlap=CHUNK_OVERLAP
             ):
         super().__init__()
         self.batch_size = batch_size
@@ -149,28 +187,22 @@ class JudgmentsDataModule(pl.LightningDataModule):
         self.test_df = test_df
         self.tokenizer = tokenizer
         self.max_token_len = max_token_len
-        self.sliding_window_stride = sliding_window_stride
-
-        self.data_collator = DataCollatorWithPadding(
-                tokenizer=self.tokenizer,
-                padding="max_length",
-                max_length=self.max_token_len,
-                return_tensors="pt",
-                )
+        self.chunk_overlap = chunk_overlap
+        self.collate_fn = ChunkCollator(tokenizer)
 
     def setup(self, stage=None):
         self.train_dataset = JudgmentsDataset(
                 self.train_df,
                 self.tokenizer,
                 self.max_token_len,
-                sliding_window_stride=self.sliding_window_stride,
+                self.chunk_overlap
                 )
 
         self.test_dataset = JudgmentsDataset(
                 self.test_df,
                 self.tokenizer,
                 self.max_token_len,
-                sliding_window_stride=self.sliding_window_stride,
+                self.chunk_overlap
                 )
 
     def train_dataloader(self):
@@ -178,36 +210,12 @@ class JudgmentsDataModule(pl.LightningDataModule):
                 self.train_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
-                collate_fn=self.collate_fn,
                 num_workers=8,
                 pin_memory=True,
+                collate_fn=self.collate_fn,
                 prefetch_factor=4,
                 persistent_workers=True,
                 )
-
-    def collate_fn(self, batch):
-        flattened_batch = []
-
-        for sample in batch:
-            if isinstance(sample, list):  # Ensure each sample is a list of chunks
-                flattened_batch.extend(sample)  # Flatten the chunks into one list
-            else:
-                flattened_batch.append(sample)  # Handle single samples
-
-        # Check if we have an empty batch (this can sometimes happen)
-        if len(flattened_batch) == 0:
-            raise ValueError("Collate function received an empty batch!")
-
-        # Convert list of dictionaries into a dictionary of lists (needed for tokenizer.pad)
-        batch_dict = {key: [dic[key] for dic in flattened_batch] for key in flattened_batch[0].keys()}
-
-        # Debugging: Check the format of batch_dict
-        for key, value in batch_dict.items():
-            if not isinstance(value, list):
-                raise TypeError(f"Expected list for key '{key}', but got {type(value)}")
-
-        # Ensure correct padding using DataCollator
-        return self.data_collator(batch_dict)
 
     def val_dataloader(self):
         return DataLoader(
@@ -225,257 +233,187 @@ class JudgmentsDataModule(pl.LightningDataModule):
                 collate_fn=self.collate_fn,
                 )
 
+
 class JudgmentsTagger(pl.LightningModule):
     def __init__(
-            self, n_classes: int, batch_size=8, learning_rate=0.001, class_weights=None
+            self, n_classes: int, batch_size=32, learning_rate=0.001, class_weights=None
             ):
         super().__init__()
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        config = LongformerConfig.from_pretrained(
+        self.bert = DistilBertModel.from_pretrained(
                 BERT_MODEL_NAME,
                 return_dict=True,
-                gradient_checkpointing=True,
-                attention_window=[ATTENTION_WINDOW] * 12,
-                hidden_dropout_prob=HIDDEN_DROPOUT_PROB,
-                attention_probs_dropout_prob=ATTENTION_PROBS_DROPOUT_PROB
-                )
-        self.bert = LongformerModel.from_pretrained(
-                BERT_MODEL_NAME,
-                config=config,
                 )
 
         self.bert.gradient_checkpointing_enable()
 
-        self.dropout = nn.Dropout(ATTENTION_PROBS_DROPOUT_PROB)
-        # self.classifier = nn.Linear(self.bert.config.hidden_size, n_classes)
         self.classifier = nn.Sequential(
                 nn.Dropout(ATTENTION_PROBS_DROPOUT_PROB),
-                nn.Linear(config.hidden_size, config.hidden_size // 2),
+                nn.Linear(self.bert.config.hidden_size, self.bert.config.hidden_size // 2),
                 nn.GELU(),
                 nn.Dropout(ATTENTION_PROBS_DROPOUT_PROB),
-                nn.Linear(config.hidden_size // 2, n_classes)
+                nn.Linear(self.bert.config.hidden_size // 2, n_classes)
                 )
 
+        # Add a final aggregation layer
+        self.chunk_aggregator = nn.Sequential(
+                nn.Linear(n_classes * 2, n_classes),  # *2 for concatenating max and mean
+                nn.GELU(),
+                nn.Dropout(ATTENTION_PROBS_DROPOUT_PROB),
+                nn.Linear(n_classes, n_classes)
+                )
 
         self.n_training_steps = None
         self.n_warmup_steps = None
-
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
-        # self.criterion = nn.MSELoss()
 
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, input_ids, attention_mask, chunk_counts=None):
+        batch_size = input_ids.size(0)
+        max_chunks = input_ids.size(1)
+
+        # Reshape for processing all chunks
+        input_ids = input_ids.view(-1, input_ids.size(-1))
+        attention_mask = attention_mask.view(-1, attention_mask.size(-1))
+
         def bert_forward():
             return self.bert(input_ids, attention_mask=attention_mask)
 
         with torch.cuda.amp.autocast():
-            # Use checkpointing for bert forward pass
             bert_output = checkpoint(bert_forward)
-            pooled_output = bert_output.pooler_output
+            sequence_output = bert_output.last_hidden_state
+            pooled_output = sequence_output[:, 0]  # Use [CLS] token
 
-            # Process in chunks if needed
-            if pooled_output.shape[0] > 1:
-                chunk_size = 1
-                outputs = []
-                for i in range(0, pooled_output.shape[0], chunk_size):
-                    chunk = pooled_output[i:i + chunk_size]
-                    chunk_output = self.classifier(chunk)
-                    outputs.append(chunk_output)
-                    del chunk
-                    torch.cuda.empty_cache()
-                logits = torch.cat(outputs, dim=0)
-            else:
-                logits = self.classifier(pooled_output)
+            # Get predictions for all chunks
+            chunk_logits = self.classifier(pooled_output)
+            chunk_logits = chunk_logits.view(batch_size, max_chunks, -1)
 
-        output = torch.sigmoid(logits)
+            # Create mask for valid chunks
+            if chunk_counts is not None:
+                chunk_mask = torch.arange(max_chunks, device=chunk_counts.device).unsqueeze(0) < chunk_counts.unsqueeze(1)
+                chunk_mask = chunk_mask.unsqueeze(-1).expand(-1, -1, chunk_logits.size(-1))
+                chunk_logits = chunk_logits.masked_fill(~chunk_mask, float('-inf'))
 
-        loss = 0
-        if labels is not None:
-            loss = nn.BCEWithLogitsLoss()(logits, labels.float())
+            # Get both max and mean of chunk predictions
+            max_logits = torch.max(chunk_logits, dim=1)[0]
 
-        # Clean up
-        del bert_output, pooled_output, logits
-        torch.cuda.empty_cache()
+            # For mean, replace -inf with 0 before averaging
+            mean_mask = (chunk_logits != float('-inf')).float()
+            masked_logits = chunk_logits.masked_fill(chunk_logits == float('-inf'), 0.0)
+            mean_logits = (masked_logits.sum(dim=1) / (mean_mask.sum(dim=1) + 1e-10))
 
-        return loss, output
+            # Concatenate max and mean logits
+            combined_logits = torch.cat([max_logits, mean_logits], dim=-1)
+
+            # Final prediction using the aggregator
+            final_logits = self.chunk_aggregator(combined_logits)
+            output = torch.sigmoid(final_logits)
+
+            # Store chunk predictions for analysis if needed
+            self.last_chunk_predictions = torch.sigmoid(chunk_logits)
+
+        return output, self.last_chunk_predictions
 
     def training_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
-        loss, outputs = self(input_ids, attention_mask, labels)
-        self.log("train_loss", loss, prog_bar=True, logger=True)
+        labels = batch["labels"][:, 0]  # Take first chunk's labels (they're all the same)
+        chunk_counts = batch["chunk_counts"]
 
-        del input_ids, attention_mask, labels
-        torch.cuda.empty_cache()
-        gc.collect()
+        outputs, chunk_predictions = self(input_ids, attention_mask, chunk_counts)
 
-        # return {"loss": loss, "predictions": outputs, "labels": labels}
-        return loss
+        # Calculate main loss on final predictions
+        main_loss = self.criterion(outputs, labels.float())
 
-    def calculate_metrics(self, outputs, labels):
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        predicted_labels = (outputs > 0.5).int()
+        # Calculate auxiliary loss on individual chunk predictions
+        chunk_labels = labels.unsqueeze(1).expand(-1, chunk_predictions.size(1), -1)
+        chunk_mask = torch.arange(chunk_predictions.size(1), device=chunk_counts.device).unsqueeze(0) < chunk_counts.unsqueeze(1)
+        # Expand mask to match the predictions dimensions
+        chunk_mask = chunk_mask.unsqueeze(-1).expand(-1, -1, chunk_predictions.size(-1))
 
-        # Per-label metrics
-        per_label_metrics = {}
-        for i, article in enumerate(ARTICLES_COLUMNS):
-            # Per-label accuracy
-            label_accuracy = accuracy(
-                    preds=outputs[:, i], target=labels[:, i], task="binary"
-                    ).to(device)
+        chunk_loss = self.criterion(
+                chunk_predictions[chunk_mask].view(-1, chunk_predictions.size(-1)),
+                chunk_labels[chunk_mask].view(-1, chunk_labels.size(-1))
+                )
 
-            # Per-label precision
-            label_precision = precision(
-                    preds=outputs[:, i], target=labels[:, i], task="binary"
-                    ).to(device)
+        # Combine losses (give more weight to main loss)
+        total_loss = 0.7 * main_loss + 0.3 * chunk_loss
 
-            # Per-label recall
-            label_recall = recall(
-                    preds=outputs[:, i], target=labels[:, i], task="binary"
-                    ).to(device)
+        self.log("train_loss", total_loss, prog_bar=True, logger=True)
+        self.log("train_main_loss", main_loss, prog_bar=False, logger=True)
+        self.log("train_chunk_loss", chunk_loss, prog_bar=False, logger=True)
 
-            # Per-label F1 score
-            label_f1 = f1_score(
-                    preds=outputs[:, i], target=labels[:, i], task="binary"
-                    ).to(device)
-
-            # Per-label AUROC
-            label_auroc = auroc(
-                    preds=outputs[:, i],
-                    target=labels[:, i].type(torch.LongTensor).to(device),
-                    task="binary",
-                    ).to(device)
-
-            per_label_metrics[article] = {
-                    "accuracy": label_accuracy.item(),
-                    "precision": label_precision.item(),
-                    "recall": label_recall.item(),
-                    "f1_score": label_f1.item(),
-                    "auroc": label_auroc.item(),
-                    }
-
-            # Log per-label metrics
-            self.log(f"{article}_accuracy", label_accuracy, prog_bar=False, logger=True)
-            self.log(
-                    f"{article}_precision", label_precision, prog_bar=False, logger=True
-                    )
-            self.log(f"{article}_recall", label_recall, prog_bar=False, logger=True)
-            self.log(f"{article}_f1_score", label_f1, prog_bar=False, logger=True)
-            self.log(f"{article}_auroc", label_auroc, prog_bar=False, logger=True)
-
-        # Overall metrics (weighted average)
-        overall_accuracy = accuracy(
-                preds=outputs,
-                target=labels,
-                task="multilabel",
-                num_labels=len(ARTICLES_COLUMNS),
-                average="weighted",
-                ).to(device)
-
-        overall_f1_score = f1_score(
-                preds=outputs,
-                target=labels,
-                task="multilabel",
-                num_labels=len(ARTICLES_COLUMNS),
-                average="weighted",
-                ).to(device)
-
-        overall_precision = precision(
-                preds=outputs,
-                target=labels,
-                task="multilabel",
-                num_labels=len(ARTICLES_COLUMNS),
-                average="weighted",
-                ).to(device)
-
-        overall_recall = recall(
-                preds=outputs,
-                target=labels,
-                task="multilabel",
-                num_labels=len(ARTICLES_COLUMNS),
-                average="weighted",
-                ).to(device)
-
-        overall_auroc = auroc(
-                preds=outputs,
-                target=labels.type(torch.LongTensor).to(device),
-                task="multilabel",
-                num_labels=len(ARTICLES_COLUMNS),
-                average="weighted",
-                ).to(device)
-
-        # Log overall metrics
-        self.log("overall_accuracy", overall_accuracy, prog_bar=True, logger=True)
-        self.log("overall_f1_score", overall_f1_score, prog_bar=True, logger=True)
-        self.log("overall_precision", overall_precision, prog_bar=True, logger=True)
-        self.log("overall_recall", overall_recall, prog_bar=True, logger=True)
-        self.log("overall_auroc", overall_auroc, prog_bar=True, logger=True)
-
-        # Debugging outputs
-        print("\nPer-Label Metrics:")
-        for article, metrics in per_label_metrics.items():
-            print(f"{article}:")
-            for metric, value in metrics.items():
-                print(f"  {metric}: {value}")
-
-        print("\nOverall Metrics:")
-        print(f"Accuracy: {overall_accuracy}")
-        print(f"F1 Score: {overall_f1_score}")
-        print(f"Precision: {overall_precision}")
-        print(f"Recall: {overall_recall}")
-        print(f"AUROC: {overall_auroc}")
-
-        return {
-                "per_label_metrics": per_label_metrics,
-                "overall_metrics": {
-                        "accuracy_score": overall_accuracy,
-                        "f1_score": overall_f1_score,
-                        "precision_score": overall_precision,
-                        "recall_score": overall_recall,
-                        "multilabel_auroc": overall_auroc,
-                        },
-                }
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
-        loss, outputs = self(input_ids, attention_mask, labels)
-        self.log("val_loss", loss, prog_bar=True, logger=True)
+        labels = batch["labels"][:, 0]
+        chunk_counts = batch["chunk_counts"]
 
-        del input_ids, attention_mask, labels
-        torch.cuda.empty_cache()
-        gc.collect()
+        outputs, chunk_predictions = self(input_ids, attention_mask, chunk_counts)
 
-        return loss
+        main_loss = self.criterion(outputs, labels.float())
+
+        # Calculate chunk-level metrics
+        chunk_labels = labels.unsqueeze(1).expand(-1, chunk_predictions.size(1), -1)
+        chunk_mask = torch.arange(chunk_predictions.size(1), device=chunk_counts.device).unsqueeze(0) < chunk_counts.unsqueeze(1)
+        # Expand mask to match the predictions dimensions
+        chunk_mask = chunk_mask.unsqueeze(-1).expand(-1, -1, chunk_predictions.size(-1))
+
+        chunk_loss = self.criterion(
+                chunk_predictions[chunk_mask].view(-1, chunk_predictions.size(-1)),
+                chunk_labels[chunk_mask].view(-1, chunk_labels.size(-1))
+                )
+
+        total_loss = 0.7 * main_loss + 0.3 * chunk_loss
+
+        self.log("val_loss", total_loss, prog_bar=True, logger=True)
+        self.log("val_main_loss", main_loss, prog_bar=False, logger=True)
+        self.log("val_chunk_loss", chunk_loss, prog_bar=False, logger=True)
+
+        return total_loss
 
     def test_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
-        loss, outputs = self(input_ids, attention_mask, labels)
-        self.log("test_loss", loss, prog_bar=True, logger=True)
+        labels = batch["labels"][:, 0]
+        chunk_counts = batch["chunk_counts"]
 
-        metrics = self.calculate_metrics(outputs, labels)
+        outputs, chunk_predictions = self(input_ids, attention_mask, chunk_counts)
 
-        del input_ids, attention_mask, labels
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Calculate main metrics
+        main_metrics = self.calculate_metrics(outputs, labels)
 
-        return {"test_loss": loss, "metrics": metrics}
+        # Calculate chunk-level metrics
+        chunk_labels = labels.unsqueeze(1).expand(-1, chunk_predictions.size(1), -1)
+        chunk_mask = torch.arange(chunk_predictions.size(1), device=chunk_counts.device).unsqueeze(0) < chunk_counts.unsqueeze(1)
+        chunk_mask = chunk_mask.unsqueeze(-1)
+
+        # Get metrics for each chunk
+        chunk_metrics = []
+        for i in range(chunk_predictions.size(1)):
+            chunk_pred = chunk_predictions[:, i][chunk_mask[:, i, 0]]
+            chunk_lab = chunk_labels[:, i][chunk_mask[:, i, 0]]
+            if len(chunk_pred) > 0:  # Only calculate metrics if we have predictions for this chunk
+                chunk_metrics.append(self.calculate_metrics(chunk_pred, chunk_lab))
+
+        return {
+                "test_metrics": main_metrics,
+                "chunk_metrics": chunk_metrics,
+                "chunk_predictions": chunk_predictions[chunk_mask].cpu().numpy(),
+                "chunk_counts": chunk_counts.cpu().numpy()
+                }
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
-        # optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(self.parameters(), lr=self.learning_rate)
 
-        # Dynamically calculate training steps and warmup steps
         if self.trainer and self.trainer.datamodule:
             steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
             self.n_training_steps = steps_per_epoch * self.trainer.max_epochs
             self.n_warmup_steps = int(self.n_training_steps * 0.10)
         else:
-            raise ValueError("Trainer or datamodule not initialized. Cannot compute training steps.")
+            raise ValueError("Trainer or datamodule not initialized")
 
         scheduler = get_linear_schedule_with_warmup(
                 optimizer,
@@ -483,7 +421,6 @@ class JudgmentsTagger(pl.LightningModule):
                 num_training_steps=self.n_training_steps
                 )
 
-        # Add this configuration to ensure proper ordering
         return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -495,7 +432,6 @@ class JudgmentsTagger(pl.LightningModule):
                         "name": None,
                         },
                 }
-
 
 def calculate_multilabel_class_weights(y: np.ndarray):
     num_labels = y.shape[1]
@@ -699,25 +635,10 @@ if __name__ == "__main__":
     class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
     print(class_weights)
 
-    config = LongformerConfig.from_pretrained(
-            BERT_MODEL_NAME,
-            return_dict=True,
-            gradient_checkpointing=True,
-            attention_window=[ATTENTION_WINDOW] * 12,
-            hidden_dropout_prob=HIDDEN_DROPOUT_PROB,
-            attention_probs_dropout_prob=ATTENTION_PROBS_DROPOUT_PROB
-            )
-    # config.attention_window = [128] * config.num_hidden_layers  # Reduce from 512 to 128
-    bert_model = LongformerModel.from_pretrained(
-            BERT_MODEL_NAME,
-            config=config,
-            )
-    # Enable Memory Optimizations
-    bert_model = torch.compile(bert_model)  # Speed up training
-    bert_model = bert_model.to(memory_format=torch.channels_last)  # Optimize tensor memory layout
-
-    # bert_model = LongformerModel.from_pretrained(BERT_MODEL_NAME, return_dict=True)
-    tokenizer = LongformerTokenizer.from_pretrained(BERT_MODEL_NAME)
+    tokenizer = DistilBertTokenizer.from_pretrained(BERT_MODEL_NAME)
+    bert_model = DistilBertModel.from_pretrained(BERT_MODEL_NAME)
+    bert_model = torch.compile(bert_model)
+    bert_model = bert_model.to(memory_format=torch.channels_last)
 
     # Try on a random row
     sample_row = cases_to_articles_df.sample(1).squeeze()
