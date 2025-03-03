@@ -29,7 +29,7 @@ RANDOM_SEED = 42
 MAX_TOKEN_COUNT = 512  # DistilBERT's maximum token length
 STRIDE = 256  # Stride for the sliding window (replaced CHUNK_OVERLAP)
 N_EPOCHS = 10
-BATCH_SIZE = 16  # Reduced batch size to allow for sliding window approach
+BATCH_SIZE = 8  # Reduced batch size to allow for sliding window approach
 GRADIENT_ACCUMULATION_STEPS = 4  # Increased to compensate for smaller batches
 EVAL_FREQUENCY = 2  # Reduced validation frequency
 HIDDEN_DROPOUT_PROB = 0.3
@@ -50,7 +50,7 @@ os.makedirs(model_dir, exist_ok=True)
 
 class JudgmentsDataset(Dataset):
     def __init__(self, data: pd.DataFrame, tokenizer: DistilBertTokenizer, max_token_len: int = MAX_TOKEN_COUNT,
-            stride: int = STRIDE):
+                 stride: int = STRIDE):
         self.tokenizer = tokenizer
         self.data = data[['judgment'] + ARTICLES_COLUMNS].copy()
         self.max_token_len = max_token_len
@@ -67,7 +67,7 @@ class JudgmentsDataset(Dataset):
 
         # Tokenize the text
         tokenized = self.tokenizer(judgment, truncation=True, max_length=self.max_token_len, padding="max_length",
-                return_overflowing_tokens=True, stride=self.stride, return_tensors="pt")
+                                   return_overflowing_tokens=True, stride=self.stride, return_tensors="pt")
 
         # Get number of chunks created by sliding window
         num_chunks = len(tokenized["input_ids"])
@@ -98,15 +98,15 @@ class JudgmentsDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True,
-                collate_fn=self.sliding_window_collate_fn, )
+                          collate_fn=self.sliding_window_collate_fn, )
 
     def val_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=2,
-                collate_fn=self.sliding_window_collate_fn, )
+                          collate_fn=self.sliding_window_collate_fn, )
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=2,
-                collate_fn=self.sliding_window_collate_fn, )
+                          collate_fn=self.sliding_window_collate_fn, )
 
     def sliding_window_collate_fn(self, batch):
         """
@@ -124,7 +124,10 @@ class JudgmentsDataModule(pl.LightningDataModule):
             all_input_ids.append(item["input_ids"])
             all_attention_masks.append(item["attention_mask"])
             # Repeat labels for each chunk
-            all_labels.extend([item["labels"]] * num_chunks)
+            # all_labels.extend([item["labels"]] * num_chunks)
+
+            # Store only one set of labels per document instead of repeating for each chunk
+            all_labels.append(item["labels"])
             batch_boundaries.append(batch_boundaries[-1] + num_chunks)
 
         # Concatenate all chunks into single tensors
@@ -150,8 +153,8 @@ class JudgmentsTagger(pl.LightningModule):
 
         # Simplified classifier
         self.classifier = nn.Sequential(nn.Dropout(ATTENTION_PROBS_DROPOUT_PROB),
-                nn.Linear(self.bert.config.hidden_size, self.bert.config.hidden_size // 2), nn.GELU(),
-                nn.Dropout(HIDDEN_DROPOUT_PROB), nn.Linear(self.bert.config.hidden_size // 2, n_classes))
+                                        nn.Linear(self.bert.config.hidden_size, self.bert.config.hidden_size // 2), nn.GELU(),
+                                        nn.Dropout(HIDDEN_DROPOUT_PROB), nn.Linear(self.bert.config.hidden_size // 2, n_classes))
 
         self.n_training_steps = None
         self.n_warmup_steps = None
@@ -252,7 +255,7 @@ class JudgmentsTagger(pl.LightningModule):
 
         # Use linear schedule with warmup
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.n_warmup_steps,
-                num_training_steps=self.n_training_steps)
+                                                    num_training_steps=self.n_training_steps)
 
         return {
                 "optimizer": optimizer, "lr_scheduler": {
@@ -389,14 +392,14 @@ if __name__ == "__main__":
 
     # Create data module
     data_module = JudgmentsDataModule(train_df, val_df, tokenizer, batch_size=BATCH_SIZE, max_token_len=MAX_TOKEN_COUNT,
-            stride=STRIDE)
+                                      stride=STRIDE)
 
     # Initialize model
     model = JudgmentsTagger(n_classes=len(ARTICLES_COLUMNS), batch_size=BATCH_SIZE, class_weights=class_weights_tensor)
 
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(dirpath=model_dir, filename=model_name, save_top_k=1, monitor="val_loss",
-            mode="min", )
+                                          mode="min", )
 
     early_stopping_callback = EarlyStopping(monitor="val_loss", patience=3, min_delta=0.001)
 
@@ -408,10 +411,10 @@ if __name__ == "__main__":
         model.learning_rate = saved_lr
 
     # Create trainer
-    trainer = pl.Trainer(accelerator="gpu", devices=1, precision="16-mixed",
-            accumulate_grad_batches=GRADIENT_ACCUMULATION_STEPS, max_epochs=N_EPOCHS, strategy="deepspeed_stage_2",
-            check_val_every_n_epoch=EVAL_FREQUENCY, gradient_clip_val=1.0, logger=logger,
-            callbacks=[early_stopping_callback, checkpoint_callback, DeviceStatsMonitor()], log_every_n_steps=100)
+    trainer = pl.Trainer(accelerator="gpu", devices=1, precision="bf16-mixed",
+                         accumulate_grad_batches=GRADIENT_ACCUMULATION_STEPS, max_epochs=N_EPOCHS, strategy="deepspeed_stage_2",
+                         check_val_every_n_epoch=EVAL_FREQUENCY, gradient_clip_val=1.0, logger=logger,
+                         callbacks=[early_stopping_callback, checkpoint_callback, DeviceStatsMonitor()], log_every_n_steps=100)
 
     # Clean up before training
     cleanup()
