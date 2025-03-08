@@ -39,6 +39,7 @@ DB_PATH = "/teamspace/studios/this_studio/echr_cases_anonymized.sqlite"
 
 model_name = "echr_judgments_classifier"
 model_dir = "/teamspace/studios/this_studio/echr_distilbert_model_sliding_window"
+metrics_dir = os.path.join(model_dir, "metrics")
 LR_CONFIG = model_dir + "/lr_config.json"
 
 pl.seed_everything(RANDOM_SEED)
@@ -46,6 +47,7 @@ nltk.download("stopwords")
 nltk.download("wordnet")
 torch.set_float32_matmul_precision("medium")
 os.makedirs(model_dir, exist_ok=True)
+os.makedirs(metrics_dir, exist_ok=True)
 
 
 class JudgmentsDataset(Dataset):
@@ -218,7 +220,7 @@ class JudgmentsTagger(pl.LightningModule):
         # Calculate loss on document-level predictions
         loss = self.criterion(doc_outputs, labels)
 
-        self.log("val_loss", loss, prog_bar=True, logger=True, batch_size=self.batch_size)
+        self.log("val_loss", loss, prog_bar=True, logger=True, batch_size=self.batch_size, sync_dist=True)
 
         return loss
 
@@ -238,7 +240,7 @@ class JudgmentsTagger(pl.LightningModule):
         accuracy = (preds_binary == labels).float().mean(dim=0)
 
         # Log average accuracy
-        self.log("test_accuracy", accuracy.mean(), logger=True, batch_size=self.batch_size)
+        self.log("test_accuracy", accuracy.mean(), logger=True, batch_size=self.batch_size, sync_dist=True)
 
         return {"test_preds": preds, "test_labels": labels}
 
@@ -423,6 +425,16 @@ if __name__ == "__main__":
     print(f"Training with learning rate: {model.learning_rate}")
     trainer.fit(model=model, datamodule=data_module)
 
+    print(f"Saving final model")
+    trainer.save_checkpoint(f"{model_dir}/final_model.ckpt")
+
     # Evaluate the model
-    trainer.validate(model=model, datamodule=data_module)
-    trainer.test(ckpt_path="best", datamodule=data_module)
+    validation_metrics = trainer.validate(model=model, datamodule=data_module)
+    print(f"Saving validation metrics")
+    with open(os.path.join(metrics_dir, "validation_metrics.json"), "w") as f:
+        json.dump(validation_metrics, f)
+
+    test_metrics = trainer.test(ckpt_path="best", datamodule=data_module)
+    print(f"Saving test metrics")
+    with open(os.path.join(metrics_dir, "test_metrics.json"), "w") as f:
+        json.dump(test_metrics, f)
