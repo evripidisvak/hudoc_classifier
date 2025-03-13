@@ -30,7 +30,7 @@ MAX_TOKEN_COUNT = 512  # DistilBERT's maximum token length
 STRIDE = 256  # Stride for the sliding window (replaced CHUNK_OVERLAP)
 N_EPOCHS = 10
 BATCH_SIZE = 8  # Reduced batch size to allow for sliding window approach
-GRADIENT_ACCUMULATION_STEPS = 4  # Increased to compensate for smaller batches
+GRADIENT_ACCUMULATION_STEPS = 4 # Increased to compensate for smaller batches
 EVAL_FREQUENCY = 2  # Reduced validation frequency
 HIDDEN_DROPOUT_PROB = 0.3
 ATTENTION_PROBS_DROPOUT_PROB = 0.3
@@ -265,6 +265,21 @@ class JudgmentsTagger(pl.LightningModule):
                         }
                 }
 
+    def save_pretrained(self, save_directory):
+        """Save the model config and weights"""
+        # Save the config
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save model config
+        config_dict = {
+                'n_classes': self.classifier[-1].out_features,
+                'hidden_dropout_prob': HIDDEN_DROPOUT_PROB,
+                'attention_probs_dropout_prob': ATTENTION_PROBS_DROPOUT_PROB,
+                'bert_model_name': BERT_MODEL_NAME,
+                }
+        with open(os.path.join(save_directory, 'model_config.json'), 'w') as f:
+            json.dump(config_dict, f)
+
 
 def calculate_multilabel_class_weights(y: np.ndarray):
     num_labels = y.shape[1]
@@ -425,8 +440,15 @@ if __name__ == "__main__":
     print(f"Training with learning rate: {model.learning_rate}")
     trainer.fit(model=model, datamodule=data_module)
 
+    # Save article labels mapping
+    print(f"Saving article labels mapping")
+    article_labels = {str(i): article for i, article in enumerate(ARTICLES_COLUMNS)}
+    with open(os.path.join(model_dir, "article_labels.json"), 'w') as f:
+        json.dump(article_labels, f)
+
     print(f"Saving final model")
     trainer.save_checkpoint(f"{model_dir}/final_model.ckpt")
+    model.save_pretrained(model_dir)
 
     # Evaluate the model
     validation_metrics = trainer.validate(model=model, datamodule=data_module)
