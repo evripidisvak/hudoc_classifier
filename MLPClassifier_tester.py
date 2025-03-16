@@ -1,3 +1,4 @@
+import gc
 import pickle
 import sqlite3
 import os
@@ -78,10 +79,17 @@ def preprocess_judgment(judgment):
         print(f"Error preprocessing judgment: {e}")
         return None
 
-def predict_with_models(models, features):
+def predict_with_models(features):
     print("Predicting related articles...")
     predictions = {}
-    for model_name, model in models.items():
+
+    for file in os.listdir(MODEL_DIR):
+        if file.startswith('mlp_') and file.endswith('.pkl'):
+            model_path = os.path.join(MODEL_DIR, file)
+            model_name = os.path.splitext(file)[0].split('_')[1]
+            model = load_model(model_path)
+        else:
+            continue
         try:
             # Get probability of the positive class (index 1)
             pred_proba = model.predict_proba(features)
@@ -95,6 +103,9 @@ def predict_with_models(models, features):
         except Exception as e:
             print(f"Error predicting with model {model_name}: {e}")
             predictions[model_name] = None
+        del model
+        gc.collect()
+
     return predictions
 
 def display_results(judgment, predictions):
@@ -131,22 +142,6 @@ if __name__ == "__main__":
     parser.add_argument('--judgment_id', type=str, help='Specific judgment ID to test (random if not provided)')
     args = parser.parse_args()
 
-    # Load all models from the directory
-    models = {}
-    for file in os.listdir(MODEL_DIR):
-        if file.startswith('mlp_') and file.endswith('.pkl'):
-            model_path = os.path.join(MODEL_DIR, file)
-            model_name = os.path.splitext(file)[0].split('_')[1]
-            model = load_model(model_path)
-            if model:
-                models[model_name] = model
-
-    if not models:
-        print("No models loaded, exiting")
-        exit()
-
-    print(f"Loaded {len(models)} models: {', '.join(models.keys())}")
-
     # Get judgment
     judgment = get_judgment(args.judgment_id)
     if not judgment:
@@ -160,7 +155,7 @@ if __name__ == "__main__":
         exit()
 
     # Make predictions
-    predictions = predict_with_models(models, features)
+    predictions = predict_with_models(features)
 
     # Display results
     display_results(judgment, predictions)
