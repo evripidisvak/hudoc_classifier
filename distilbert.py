@@ -404,19 +404,32 @@ def train_model_with_hyperparams(
     """Train model with specific hyperparameters"""
     num_labels = len(articles)
 
-    config = DistilBertConfig.from_pretrained(
-            "distilbert-base-uncased",
-            num_labels=num_labels,
-            problem_type="multi_label_classification",
-            attention_dropout=0.1,
-            hidden_dropout_prob=0.1,
-            )
+    # Check if a saved model exists
+    if os.path.exists(os.path.join(MODEL_DIR, "pytorch_model.bin")):
+        print("Existing model found. Loading for continued training...")
+        model = DistilBertForSequenceClassification.from_pretrained(
+                MODEL_DIR,
+                num_labels=num_labels,
+                problem_type="multi_label_classification",
+                )
+        print("Loaded existing model weights.")
+    else:
+        # Create a new model if no existing model is found
+        config = DistilBertConfig.from_pretrained(
+                "distilbert-base-uncased",
+                num_labels=num_labels,
+                problem_type="multi_label_classification",
+                attention_dropout=0.1,
+                hidden_dropout_prob=0.1,
+                )
 
-    # Create the multi-label classification model
-    model = DistilBertForSequenceClassification.from_pretrained(
-            "distilbert-base-uncased",
-            config=config,
-            )
+        # Create the multi-label classification model
+        model = DistilBertForSequenceClassification.from_pretrained(
+                "distilbert-base-uncased",
+                config=config,
+                )
+        print("Created new model from scratch.")
+
     model.gradient_checkpointing_enable()
     model.to(device)
 
