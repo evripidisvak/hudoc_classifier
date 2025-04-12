@@ -1,171 +1,190 @@
-import argparse
-import json
 import os
-import sqlite3
+import json
 import torch
+import sqlite3
+import numpy as np
 import pandas as pd
-from transformers import DistilBertTokenizerFast
-import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 
-# Set the same constants as in the training script
-MAX_TOKEN_COUNT = 512
-STRIDE = 256
-MODEL_DIR = "/teamspace/studios/this_studio/echr_distilbert_model_sliding_window"
-DB_PATH = "/teamspace/studios/this_studio/echr_cases_anonymized.sqlite"
+# Import configurations from the training script
+from distilbert import (
+    DB_PATH,
+    MODEL_DIR,
+    DATASETS_DIR,
+    device
+    )
 
-
-def predict_single_judgment(text, model, tokenizer, article_labels, threshold=0.5):
+def load_trained_model_and_resources():
     """
-    Predict articles for a single judgment text
-
-    Args:
-        text: The judgment text to analyze
-        model: Trained JudgmentsTagger model
-        tokenizer: Tokenizer for the model
-        article_labels: Mapping between indices and article names
-        threshold: Threshold for binary prediction
+    Load the trained model, tokenizer, and article list
 
     Returns:
-        List of dictionaries with predicted articles
+    --------
+    tuple: (model, tokenizer, articles)
     """
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
+    # Load articles list
+    with open(os.path.join(DATASETS_DIR, "articles.json"), "r") as f:
+        articles = json.load(f)
 
-    # Tokenize with sliding window
-    tokenized = tokenizer(
-            text,
-            truncation=True,
-            max_length=MAX_TOKEN_COUNT,
-            padding="max_length",
-            return_overflowing_tokens=True,
-            stride=STRIDE,
-            return_tensors="pt",
-            )
-
-    # Get number of chunks
-    input_ids = tokenized["input_ids"].to(device)
-    attention_mask = tokenized["attention_mask"].to(device)
-    num_chunks = len(input_ids)
-
-    # Create batch boundaries for a single document
-    batch_boundaries = [0, num_chunks]
-
-    # Predict
-    with torch.no_grad():
-        outputs = model(input_ids, attention_mask, batch_boundaries)
-
-        # Apply sigmoid for probabilities
-        probs = torch.sigmoid(outputs).cpu().numpy()[0]  # Get first (only) result
-
-        # Apply threshold
-        binary_preds = (probs > threshold).astype(int)
-
-    # Convert to article names with confidence
-    predicted_articles = []
-    for j, val in enumerate(binary_preds):
-        if val == 1:
-            predicted_articles.append(
-                    {"article": article_labels[str(j)], "confidence": float(probs[j])}
-                    )
-
-    # Sort by confidence
-    predicted_articles.sort(key=lambda x: x["confidence"], reverse=True)
-
-    return predicted_articles
-
-
-def load_model_and_tokenizer(model_dir):
-    """Load the trained model and tokenizer without needing the class definition"""
-    # Load checkpoint without class definition
-    checkpoint_path = os.path.join(model_dir, "final_model.ckpt")
-
-    # Load model directly from checkpoint
-    model = pl.utilities.cloud_io.load(checkpoint_path)
+    # Load tokenizer and model
+    tokenizer = DistilBertTokenizer.from_pretrained(MODEL_DIR)
+    model = DistilBertForSequenceClassification.from_pretrained(MODEL_DIR)
+    model.to(device)
     model.eval()  # Set to evaluation mode
 
-    # Load tokenizer
-    tokenizer = DistilBertTokenizerFast.from_pretrained(model_dir)
+    return model, tokenizer, articles
 
-    # Load article labels mapping
-    with open(os.path.join(model_dir, "article_labels.json"), "r") as f:
-        article_labels = json.load(f)
+def get_random_case(include_true_articles=True):
+    """
+    Retrieve a random case from the database
 
-    return model, tokenizer, article_labels
+    Parameters:
+    -----------
+    include_true_articles: bool
+        If True, also retrieve the true articles for the case
 
+    Returns:
+    --------
+    dict: Case information including text and optionally true articles
+    """
+    conn = sqlite3.connect(DB_PATH)
 
-def get_judgment(judgment_id=None):
-    """Fetch a specific judgment or a random one from the database."""
-    try:
-        print("Connecting to DB...")
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+    if include_true_articles:
+        # Join cases with articles to get true article labels
+        query = """
+        SELECT c.case_id, c.anonymized_judgement, 
+               GROUP_CONCAT(DISTINCT a.normalized_article) as articles
+        FROM cases c
+        JOIN articles a ON c.case_id = a.case_id
+        GROUP BY c.case_id
+        ORDER BY RANDOM()
+        LIMIT 1
+        """
+        df = pd.read_sql(query, conn)
+        case = {
+                'case_id': df.iloc[0]['case_id'],
+                'text': df.iloc[0]['anonymized_judgement'],
+                'true_articles': df.iloc[0]['articles'].split(',')
+                }
+    else:
+        # Just get a random case text
+        query = "SELECT case_id, anonymized_judgement FROM cases ORDER BY RANDOM() LIMIT 1"
+        df = pd.read_sql(query, conn)
+        case = {
+                'case_id': df.iloc[0]['case_id'],
+                'text': df.iloc[0]['anonymized_judgement']
+                }
 
-        if judgment_id:
-            cursor.execute(f"SELECT * FROM cases WHERE case_id = '{judgment_id}'")
-            result = cursor.fetchone()
+    conn.close()
+    return case
 
-            if not result:
-                print(f"No judgment found with ID {judgment_id}")
-                return None
-        else:
-            # Get a random judgment
-            cursor.execute("SELECT * FROM cases ORDER BY RANDOM() LIMIT 1")
-            result = cursor.fetchone()
+def predict_case_articles(model, tokenizer, case_text, articles, threshold=0.5):
+    """
+    Predict articles for a given case text
 
-            if not result:
-                print("No judgments found in the database")
-                return None
+    Parameters:
+    -----------
+    model: Trained DistilBERT model
+    tokenizer: Tokenizer
+    case_text: str, input case text to classify
+    articles: list, list of possible articles
+    threshold: float, probability threshold for positive prediction
 
-        # Convert row to dict
-        judgment = {"case_id": result[1], "judgement": result[2]}
-        # Get associated articles
-        cursor.execute(
-                f"SELECT normalized_article FROM articles WHERE normalized_article != '' AND case_id = '{judgment['case_id']}';"
-                )
-        result_articles = cursor.fetchall()
-        judgment["articles"] = [item for t in result_articles for item in t]
+    Returns:
+    --------
+    dict: Detailed prediction results
+    """
+    # Tokenize input
+    inputs = tokenizer(
+            case_text,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt',
+            padding='max_length'
+            ).to(device)
 
-        return judgment
-    except Exception as e:
-        print(f"Error fetching judgment: {e}")
-        return None
+    # Make prediction
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        probabilities = torch.sigmoid(logits).cpu().numpy()[0]
 
+    # Convert to binary predictions based on threshold
+    predictions = (probabilities > threshold).astype(int)
+
+    # Prepare detailed results
+    results = {
+            'probabilities': {article: float(prob) for article, prob in zip(articles, probabilities)},
+            'predictions': {article: int(pred) for article, pred in zip(articles, predictions)},
+            'predicted_articles': [article for article, pred in zip(articles, predictions) if pred == 1]
+            }
+
+    return results
+
+def analyze_prediction(prediction, true_articles):
+    """
+    Analyze prediction accuracy
+
+    Parameters:
+    -----------
+    prediction: dict from predict_case_articles
+    true_articles: list of true article labels
+
+    Returns:
+    --------
+    dict: Prediction analysis
+    """
+    # Get predicted and true articles
+    predicted_articles = prediction['predicted_articles']
+
+    # Compute analysis metrics
+    correct_predictions = set(predicted_articles) & set(true_articles)
+    missed_articles = set(true_articles) - set(predicted_articles)
+    false_positives = set(predicted_articles) - set(true_articles)
+
+    return {
+            'total_true_articles': len(true_articles),
+            'true_articles': list(true_articles),
+            'total_predicted_articles': len(predicted_articles),
+            'predictions': list(predicted_articles),
+            'correct_predictions': list(correct_predictions),
+            'missed_articles': list(missed_articles),
+            'false_positives': list(false_positives),
+            'precision': len(correct_predictions) / len(predicted_articles) if predicted_articles else 0,
+            'recall': len(correct_predictions) / len(true_articles) if true_articles else 0
+            }
 
 def main():
-    parser = argparse.ArgumentParser(
-            description="Test LinearSVC models against judgments"
-            )
-    parser.add_argument(
-            "--judgment_id",
-            type=str,
-            help="Specific judgment ID to test (random if not provided)",
-            )
-    args = parser.parse_args()
+    # Load trained model and resources
+    print("Loading trained model and resources...")
+    model, tokenizer, articles = load_trained_model_and_resources()
 
-    # Load model and tokenizer
-    model, tokenizer, article_labels = load_model_and_tokenizer(MODEL_DIR)
+    # Fetch a random case
+    print("\nFetching a random case...")
+    case = get_random_case()
 
-    # Get judgment
-    judgment = get_judgment(args.judgment_id)
-    if not judgment:
-        print("No judgment found. Exiting...")
-        exit()
+    # Print case details
+    print(f"\n=== Case ID: {case['case_id']} ===")
+    print("\nTrue Articles:", case['true_articles'])
 
     # Predict articles
-    predictions = predict_single_judgment(
-            judgment["judgment"], model, tokenizer, article_labels
-            )
+    print("\nPredicting articles...")
+    prediction = predict_case_articles(model, tokenizer, case['text'], articles)
 
-    # Print results
-    print("\nPredicted articles:")
-    if predictions:
-        for article in predictions:
-            print(f"  - {article['article']} (confidence: {article['confidence']:.4f})")
-    else:
-        print("  No articles predicted above threshold")
+    # Print prediction probabilities
+    print("\nArticle Prediction Probabilities:")
+    sorted_probs = sorted(prediction['probabilities'].items(), key=lambda x: x[1], reverse=True)
+    for article, prob in sorted_probs:
+        print(f"{article}: {prob:.4f}")
+
+    # Analyze prediction
+    print("\nAnalyzing predictions...")
+    analysis = analyze_prediction(prediction, case['true_articles'])
+
+    # Print detailed analysis
+    print("\nDetailed Prediction Analysis:")
+    for key, value in analysis.items():
+        print(f"{key}: {value}")
 
 if __name__ == "__main__":
     main()

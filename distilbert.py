@@ -15,6 +15,8 @@ from transformers import (
     EarlyStoppingCallback,
     DistilBertConfig,
     )
+# Add the missing import for PredictionOutput
+from transformers.trainer_utils import PredictionOutput
 from datasets import Dataset, load_from_disk
 import optuna
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -23,7 +25,7 @@ import gc
 
 DB_PATH = "hudoc_classifier/echr_cases_anonymized.sqlite"
 MODEL_DIR = "echr_distilbert_model_v2"
-DATASETS_DIR = "echr_processed_datasets"  # Directory to save processed datasets
+DATASETS_DIR = "echr_processed_datasets"
 METRICS_FILE = "distilbert_metrics.json"
 HYPERPARAMS_FILE = os.path.join(MODEL_DIR, "best_hyperparameters.json")
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -149,9 +151,18 @@ def preprocess_data(df_cases, df_articles):
     case_texts = df_cases[["case_id", "anonymized_judgement"]].drop_duplicates()
 
     # Create a pivot table of articles for each case
+    # pivot_df = pd.crosstab(
+    #         df_articles["case_id"], df_articles["normalized_article"]
+    #         ).astype(int)
+
     pivot_df = pd.crosstab(
-            df_articles["case_id"], df_articles["normalized_article"]
-            ).astype(int)
+            df_articles["case_id"],
+            df_articles["normalized_article"],
+            values=1,  # Set value to 1 for all matches
+            aggfunc='count'  # Count occurrences
+            ).fillna(0)
+    pivot_df = (pivot_df > 0).astype(int)
+    cases_to_articles_df = df_cases.merge(pivot_df, on="case_id", how="left").fillna(0)
 
     # Merge the text with the article labels
     merged_df = case_texts.merge(pivot_df, on="case_id", how="inner")
@@ -186,56 +197,154 @@ def compute_class_weights(df, articles):
     return torch.tensor(weights).to(device)
 
 
-def create_datasets(df, tokenizer, articles, max_length=512, test_size=0.2):
+def create_datasets(df, tokenizer, articles, max_length=512, stride=256, test_size=0.2):
+    """
+    Create train and test datasets with sliding window for long documents in a memory-efficient way
+
+    Parameters:
+    -----------
+    df: DataFrame containing case data
+    tokenizer: HuggingFace tokenizer
+    articles: List of article names to use as labels
+    max_length: Maximum sequence length for each window
+    stride: Number of overlapping tokens between consecutive windows
+    test_size: Fraction of data to use for testing
+
+    Returns:
+    --------
+    Dictionary containing train and test datasets
+    """
+    # Reset index to avoid the __index_level_0__ issue
+    df = df.reset_index(drop=True)
+
     # Split data first
     train_df, test_df = train_test_split(df, test_size=test_size, random_state=42)
 
-    # Function to tokenize and prepare examples
-    def process_example(example):
-        # Process inputs
-        inputs = tokenizer(
-                example["anonymized_judgement"],
-                truncation=True,
-                max_length=max_length,
-                return_tensors=None,  # Don't return tensors here
-                padding="max_length",
-                )
+    # Create empty output directories to save dataset chunks
+    train_output_dir = os.path.join(DATASETS_DIR, "train")
+    test_output_dir = os.path.join(DATASETS_DIR, "test")
+    os.makedirs(train_output_dir, exist_ok=True)
+    os.makedirs(test_output_dir, exist_ok=True)
 
-        # Prepare multi-label format
-        label_list = [float(example[article]) for article in articles]
+    # Process in batches to save memory
+    def process_and_save_in_batches(input_df, output_dir, batch_size=1000):
+        num_batches = len(input_df) // batch_size + (1 if len(input_df) % batch_size != 0 else 0)
+        print(f"Processing {len(input_df)} documents in {num_batches} batches...")
 
-        # Return a flat dictionary with all required fields
-        return {
-                "input_ids": inputs["input_ids"],
-                "attention_mask": inputs["attention_mask"],
-                "labels": label_list,
-                }
+        all_datasets = []
 
-    # Create datasets
-    train_dataset = Dataset.from_pandas(train_df)
-    test_dataset = Dataset.from_pandas(test_df)
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(input_df))
+            batch_df = input_df.iloc[start_idx:end_idx]
 
-    # Map tokenization - use batched=True for efficiency
-    train_dataset = train_dataset.map(
-            process_example,
-            remove_columns=["case_id", "anonymized_judgement"] + articles,
-            batched=True,
-            batch_size=32,
-            num_proc=4,
-            )
-    test_dataset = test_dataset.map(
-            process_example,
-            remove_columns=["case_id", "anonymized_judgement"] + articles,
-            batched=True,
-            batch_size=32,
-            num_proc=4,
-            )
+            print(f"Processing batch {batch_idx+1}/{num_batches} ({start_idx}:{end_idx})...")
 
-    # Save datasets to disk
-    train_dataset.save_to_disk(os.path.join(DATASETS_DIR, "train"))
-    test_dataset.save_to_disk(os.path.join(DATASETS_DIR, "test"))
+            # Process each document in the batch
+            all_input_ids = []
+            all_attention_masks = []
+            all_labels = []
+            all_case_ids = []
+            all_original_indices = []
 
-    # Clean up to free memory
+            for idx, row in batch_df.iterrows():
+                text = row["anonymized_judgement"]
+                case_id = row["case_id"]
+
+                # Extract labels for this document
+                label_values = [float(row[article]) for article in articles]
+
+                # Use tokenizer efficiently for long texts
+                # Instead of tokenizing the entire text at once, process it in chunks
+                words = text.split()
+
+                # For short documents, process as a single window
+                if len(words) <= max_length // 2:  # Approximation
+                    encoded = tokenizer(
+                            text,
+                            truncation=True,
+                            max_length=max_length,
+                            padding="max_length",
+                            return_tensors=None
+                            )
+                    all_input_ids.append(encoded["input_ids"])
+                    all_attention_masks.append(encoded["attention_mask"])
+                    all_labels.append(label_values)
+                    all_case_ids.append(case_id)
+                    all_original_indices.append(idx)
+                else:
+                    # Split into chunks with stride for long documents
+                    chunk_size = max_length // 2  # Approximate number of words per chunk
+                    stride_words = stride // 4    # Approximate stride in words
+
+                    for i in range(0, len(words), chunk_size - stride_words):
+                        chunk = " ".join(words[i:i + chunk_size])
+
+                        encoded = tokenizer(
+                                chunk,
+                                truncation=True,
+                                max_length=max_length,
+                                padding="max_length",
+                                return_tensors=None
+                                )
+
+                        all_input_ids.append(encoded["input_ids"])
+                        all_attention_masks.append(encoded["attention_mask"])
+                        all_labels.append(label_values)
+                        all_case_ids.append(case_id)
+                        all_original_indices.append(idx)
+
+            # Create dataset for this batch
+            batch_dict = {
+                    "input_ids": all_input_ids,
+                    "attention_mask": all_attention_masks,
+                    "labels": all_labels,
+                    "case_id": all_case_ids,
+                    "original_idx": all_original_indices
+                    }
+
+            # Convert to Dataset
+            batch_dataset = Dataset.from_dict(batch_dict)
+
+            # Save this batch
+            batch_path = os.path.join(output_dir, f"batch_{batch_idx}")
+            batch_dataset.save_to_disk(batch_path)
+
+            # Clear memory
+            del all_input_ids, all_attention_masks, all_labels, all_case_ids, all_original_indices
+            del batch_dict, batch_dataset
+            gc.collect()
+
+            # Keep track of batch paths
+            all_datasets.append(batch_path)
+
+        # After processing all batches, load and concatenate datasets
+        print(f"Loading and concatenating {len(all_datasets)} batches...")
+        datasets = [load_from_disk(path) for path in all_datasets]
+
+        # Use datasets concatenate method
+        combined = concatenate_datasets(datasets)
+        combined.save_to_disk(output_dir)
+
+        # Clean up batch files to save disk space
+        for path in all_datasets:
+            if os.path.exists(path):
+                shutil.rmtree(path)
+
+        return combined
+
+    # Import the concatenate_datasets function
+    from datasets import concatenate_datasets
+    import shutil
+
+    # Process train and test sets
+    print("Processing training dataset...")
+    train_dataset = process_and_save_in_batches(train_df, train_output_dir)
+
+    print("Processing test dataset...")
+    test_dataset = process_and_save_in_batches(test_df, test_output_dir)
+
+    # Final cleanup
     gc.collect()
 
     return {"train": train_dataset, "test": test_dataset}
@@ -265,20 +374,20 @@ def compute_metrics(eval_pred):
 class MultiLabelClassificationTrainer(Trainer):
     """
     Custom Trainer to handle class weights for multi-label classification
+    and aggregate predictions from multiple windows of the same document
     """
 
     def __init__(self, class_weights=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights.to(device) if class_weights is not None else None
-        self.scaler = GradScaler('cuda') if torch.cuda.is_available() else None
+        self.scaler = GradScaler() if torch.cuda.is_available() and self.args.fp16 else None
 
-    def compute_loss(
-            self, model, inputs, return_outputs=False, num_items_in_batch=None
-            ):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         inputs = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         labels = inputs.pop("labels")
         # Use autocast for mixed precision
-        with autocast('cuda', enabled=self.args.fp16):
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        with autocast(device_type=device_type, enabled=self.args.fp16):
             outputs = model(**inputs)
             logits = outputs.logits
 
@@ -293,6 +402,60 @@ class MultiLabelClassificationTrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """
+        Override prediction_step to keep track of original_idx for window aggregation
+        """
+        has_original_idx = "original_idx" in inputs
+        original_idx = inputs.pop("original_idx", None)
+
+        # Call the parent class's prediction_step
+        loss, logits, labels = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+
+        # If we're in prediction mode and have original_idx, return it alongside the predictions
+        if not prediction_loss_only and has_original_idx:
+            return loss, logits, labels, original_idx
+
+        return loss, logits, labels
+
+    def predict(self, test_dataset, ignore_keys=None, metric_key_prefix="test"):
+        """
+        Override predict to aggregate predictions from multiple windows of the same document
+        """
+        # Run the standard prediction step to get window-level predictions
+        outputs = super().predict(test_dataset, ignore_keys, metric_key_prefix)
+
+        # If the dataset doesn't have original_idx, return standard predictions
+        if not hasattr(test_dataset, "features") or "original_idx" not in test_dataset.features:
+            return outputs
+
+        # Get the original indices and predictions
+        original_indices = np.array(test_dataset["original_idx"])
+        window_predictions = outputs.predictions
+
+        # Find unique document indices
+        unique_docs = np.unique(original_indices)
+        num_docs = len(unique_docs)
+        num_labels = window_predictions.shape[1]
+
+        # Prepare aggregated predictions
+        doc_predictions = np.zeros((num_docs, num_labels))
+
+        # Aggregate predictions for each document using max pooling across windows
+        for i, doc_idx in enumerate(unique_docs):
+            # Get all windows belonging to this document
+            doc_windows = original_indices == doc_idx
+            # Max pooling: take highest prediction score across all windows
+            doc_predictions[i] = np.max(window_predictions[doc_windows], axis=0)
+
+        # Create a new PredictionOutput with aggregated predictions
+        aggregated_outputs = PredictionOutput(
+                predictions=doc_predictions,
+                label_ids=outputs.label_ids[np.array([np.where(original_indices == idx)[0][0] for idx in unique_docs])],
+                metrics=outputs.metrics,
+                )
+
+        return aggregated_outputs
 
 def load_or_tune_hyperparameters(
         train_dataset,
@@ -405,30 +568,30 @@ def train_model_with_hyperparams(
     num_labels = len(articles)
 
     # Check if a saved model exists
-    if os.path.exists(os.path.join(MODEL_DIR, "pytorch_model.bin")):
-        print("Existing model found. Loading for continued training...")
-        model = DistilBertForSequenceClassification.from_pretrained(
-                MODEL_DIR,
-                num_labels=num_labels,
-                problem_type="multi_label_classification",
-                )
-        print("Loaded existing model weights.")
-    else:
-        # Create a new model if no existing model is found
-        config = DistilBertConfig.from_pretrained(
-                "distilbert-base-uncased",
-                num_labels=num_labels,
-                problem_type="multi_label_classification",
-                attention_dropout=0.1,
-                hidden_dropout_prob=0.1,
-                )
+    # if os.path.exists(MODEL_DIR):
+    #     print("Existing model found. Loading for continued training...")
+    #     model = DistilBertForSequenceClassification.from_pretrained(
+    #             MODEL_DIR,
+    #             num_labels=num_labels,
+    #             problem_type="multi_label_classification",
+    #             )
+    #     print("Loaded existing model weights.")
+    # else:
+    # Create a new model if no existing model is found
+    config = DistilBertConfig.from_pretrained(
+            "distilbert-base-uncased",
+            num_labels=num_labels,
+            problem_type="multi_label_classification",
+            attention_dropout=0.1,
+            hidden_dropout_prob=0.1,
+            )
 
-        # Create the multi-label classification model
-        model = DistilBertForSequenceClassification.from_pretrained(
-                "distilbert-base-uncased",
-                config=config,
-                )
-        print("Created new model from scratch.")
+    # Create the multi-label classification model
+    model = DistilBertForSequenceClassification.from_pretrained(
+            "distilbert-base-uncased",
+            config=config,
+            )
+    print("Created new model from scratch.")
 
     model.gradient_checkpointing_enable()
     model.to(device)
@@ -438,7 +601,7 @@ def train_model_with_hyperparams(
             output_dir=MODEL_DIR,
             eval_strategy="epoch",
             save_strategy="epoch",
-            num_train_epochs=50,
+            num_train_epochs=20,
             per_device_train_batch_size=hyperparams.get("per_device_train_batch_size", 8),
             gradient_accumulation_steps=hyperparams.get("gradient_accumulation_steps", 4),
             per_device_eval_batch_size=hyperparams.get("per_device_eval_batch_size", 8),
@@ -457,7 +620,7 @@ def train_model_with_hyperparams(
             dataloader_pin_memory=True,
             gradient_checkpointing=True,
             optim="adamw_torch",
-            bf16=torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8,
+            # bf16=torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8,
             no_cuda=not torch.cuda.is_available(),
             ddp_find_unused_parameters=False,
             )
@@ -477,10 +640,10 @@ def train_model_with_hyperparams(
 
     # Add early stopping callback
     trainer.add_callback(
-            EarlyStoppingCallback(early_stopping_patience=5, early_stopping_threshold=0.001)
+            EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.001)
             )
 
-    profile_results = profile_model_operations(model, trainer, num_steps=5)
+    # profile_results = profile_model_operations(model, trainer, num_steps=5)
 
     trainer.train()
     model.save_pretrained(MODEL_DIR)
@@ -495,15 +658,28 @@ def train_model_with_hyperparams(
 
 
 def evaluate_model(model, trainer, eval_dataset, articles):
-    # Make predictions
+    """
+    Evaluate the model with support for the sliding window approach
+    """
+    # Make predictions with window aggregation
     outputs = trainer.predict(eval_dataset)
     predictions = outputs.predictions
 
     # Convert to binary predictions (threshold = 0.5)
     preds = (predictions > 0).astype(int)
 
-    # Get true labels
-    true_labels = np.array(eval_dataset["labels"])
+    # Get true labels - we need to handle the case where we have multiple windows per document
+    if "original_idx" in eval_dataset.features:
+        # Get unique document indices
+        unique_docs = np.unique(eval_dataset["original_idx"])
+        # Get the first window's labels for each document (all windows have the same labels)
+        true_labels = np.array([
+                eval_dataset["labels"][np.where(np.array(eval_dataset["original_idx"]) == doc_idx)[0][0]]
+                for doc_idx in unique_docs
+                ])
+    else:
+        # Standard case - use all labels
+        true_labels = np.array(eval_dataset["labels"])
 
     # Calculate metrics for each article
     metrics = {}
@@ -535,6 +711,8 @@ def load_articles():
 
 
 if __name__ == "__main__":
+    torch.cuda.empty_cache()
+    gc.collect()
     import argparse
 
     # Create command line arguments
