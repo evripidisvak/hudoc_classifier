@@ -1,8 +1,7 @@
 import json
 import math
-import re
 import os
-
+import re
 
 # Output file paths
 BASE_PATH = "model_metrics"
@@ -258,70 +257,152 @@ def extract_positive_class_metrics(models_data):
 
 
 def compute_average_metrics(models_data):
-    """Compute average precision, recall, f1-score per label for each model"""
+    """Compute average precision, recall, f1-score per label for each model with micro and macro averages"""
     model_averages = {}
 
     for model_name, model_data in models_data.items():
+        # For macro average (what you currently have)
         label_sums = {}
         label_counts = {}
+
+        # For micro average
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        total_samples = 0
 
         for article, metrics in model_data.items():
             for label, label_metrics in metrics.items():
                 if label == "accuracy":
                     continue
+
+                # Skip averages if they exist in the original data
+                if label in ["macro avg", "weighted avg"]:
+                    continue
+
+                # Get support (number of samples)
+                support = label_metrics.get("support", 0)
+                if not isinstance(support, (int, float)) or math.isnan(support):
+                    support = 0
+
+                # For macro average calculation
                 if label not in label_sums:
                     label_sums[label] = {
-                        "precision": 0.0,
-                        "recall": 0.0,
-                        "f1-score": 0.0,
-                    }
+                            "precision": 0.0,
+                            "recall": 0.0,
+                            "f1-score": 0.0,
+                            }
                     label_counts[label] = 0
 
                 precision_value = label_metrics.get("precision", 0.0)
-                label_sums[label]["precision"] += (
-                    precision_value
-                    if isinstance(precision_value, (int, float))
-                    and not math.isnan(precision_value)
-                    else 0.0
+                precision_value = (
+                        precision_value
+                        if isinstance(precision_value, (int, float))
+                           and not math.isnan(precision_value)
+                        else 0.0
                 )
+                label_sums[label]["precision"] += precision_value
 
                 recall_value = label_metrics.get("recall", 0.0)
-                label_sums[label]["recall"] += (
-                    recall_value
-                    if isinstance(recall_value, (int, float))
-                    and not math.isnan(recall_value)
-                    else 0.0
+                recall_value = (
+                        recall_value
+                        if isinstance(recall_value, (int, float))
+                           and not math.isnan(recall_value)
+                        else 0.0
                 )
+                label_sums[label]["recall"] += recall_value
 
                 f1_value = label_metrics.get("f1-score", 0.0)
-                label_sums[label]["f1-score"] += (
-                    f1_value
-                    if isinstance(f1_value, (int, float)) and not math.isnan(f1_value)
-                    else 0.0
+                f1_value = (
+                        f1_value
+                        if isinstance(f1_value, (int, float)) and not math.isnan(f1_value)
+                        else 0.0
                 )
+                label_sums[label]["f1-score"] += f1_value
 
                 label_counts[label] += 1
 
+                # For micro average calculation
+                # Calculate true positives, false positives, false negatives from precision and recall
+                if precision_value > 0 or recall_value > 0:  # Avoid division by zero
+                    if precision_value > 0:
+                        # TP / (TP + FP) = precision
+                        # TP = precision * (TP + FP)
+                        tp_fp = support / recall_value if recall_value > 0 else 0
+                        tp = precision_value * tp_fp
+                    else:
+                        tp = 0
+
+                    if recall_value > 0:
+                        # TP / (TP + FN) = recall
+                        # TP = recall * (TP + FN)
+                        tp_fn = support
+                        tp = recall_value * tp_fn
+                    else:
+                        tp = 0
+
+                    # Use the more reliable TP calculation
+                    tp = min(tp, support)
+
+                    # Calculate FP and FN
+                    fp = (tp / precision_value) - tp if precision_value > 0 else 0
+                    fn = (tp / recall_value) - tp if recall_value > 0 else 0
+
+                    # Accumulate for micro averaging
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+                    total_samples += support
+
+        # Calculate macro average metrics (what you currently have)
         model_averages[model_name] = {}
         for label in label_sums:
             count = label_counts[label]
             if count > 0:
                 model_averages[model_name][label] = {
-                    "average_precision": label_sums[label]["precision"] / count,
-                    "average_recall": label_sums[label]["recall"] / count,
-                    "average_f1_score": label_sums[label]["f1-score"] / count,
-                    "article_count": count,
-                }
+                        "average_precision": label_sums[label]["precision"] / count,
+                        "average_recall": label_sums[label]["recall"] / count,
+                        "average_f1_score": label_sums[label]["f1-score"] / count,
+                        "article_count": count,
+                        }
             else:
                 model_averages[model_name][label] = {
-                    "average_precision": 0.0,
-                    "average_recall": 0.0,
-                    "average_f1_score": 0.0,
-                    "article_count": 0,
+                        "average_precision": 0.0,
+                        "average_recall": 0.0,
+                        "average_f1_score": 0.0,
+                        "article_count": 0,
+                        }
+
+        # Calculate micro average metrics
+        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall) if (micro_precision + micro_recall) > 0 else 0.0
+
+        # Add micro averages to the model metrics
+        model_averages[model_name]["micro_avg"] = {
+                "average_precision": micro_precision,
+                "average_recall": micro_recall,
+                "average_f1_score": micro_f1,
+                "total_samples": total_samples,
+                }
+
+        # Calculate macro averages (true definition)
+        all_precisions = [values["average_precision"] for values in model_averages[model_name].values()
+                          if isinstance(values, dict) and "average_precision" in values and values != model_averages[model_name].get("micro_avg")]
+        all_recalls = [values["average_recall"] for values in model_averages[model_name].values()
+                       if isinstance(values, dict) and "average_recall" in values and values != model_averages[model_name].get("micro_avg")]
+        all_f1s = [values["average_f1_score"] for values in model_averages[model_name].values()
+                   if isinstance(values, dict) and "average_f1_score" in values and values != model_averages[model_name].get("micro_avg")]
+
+        # Add macro averages to the model metrics
+        model_averages[model_name]["macro_avg"] = {
+                "average_precision": sum(all_precisions) / len(all_precisions) if all_precisions else 0.0,
+                "average_recall": sum(all_recalls) / len(all_recalls) if all_recalls else 0.0,
+                "average_f1_score": sum(all_f1s) / len(all_f1s) if all_f1s else 0.0,
+                "class_count": len(all_precisions),
                 }
 
     return model_averages
-
 
 def main():
     # Load data from all model files
